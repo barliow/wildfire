@@ -1,13 +1,15 @@
 # Wildfire
 
-Quick audio transcription via **OpenAI Whisper**, triggered from the Windows right‑click **Send to → Wildfire**. Choose a target folder, name, and model; the app copies (or moves) the recording and saves a `.txt` transcript there.
+Quick audio transcription via **WhisperX** (default) or **OpenAI Whisper**, triggered from the Windows right‑click **Send to → Wildfire**. Choose a target folder, name, and model; the app copies (or moves) the recording and saves a timestamped `.txt` transcript there.
 
 ## Features
 
-- **Send to integration** — Right‑click an audio file → **Send to → Wildfire** (no admin rights).
+- **Send to integration** — Right‑click an audio or video file (e.g. `.mp3`, `.wav`, `.m4a`, `.mp4`) → **Send to → Wildfire** (no admin rights).
 - **Target folder** — Pick where to save the recording copy and the transcript.
 - **Single base name** — One name is used for both the audio file and the transcript (e.g. `meeting` → `meeting.mp3` + `meeting.txt`).
+- **Engine choice** — Use **WhisperX (recommended)** for precise timings and optional speaker labels, or fall back to base Whisper.
 - **Whisper model** — Choose from Tiny up to Large v3; UI shows speed/accuracy/disk info.
+- **Timestamps + speakers** — Transcripts include start/end timestamps for each line; with WhisperX speaker detection enabled, lines are also labelled with speaker IDs.
 - **Copy or move** — Option to move the source file into the target folder instead of copying.
 
 ## Requirements
@@ -54,12 +56,12 @@ Quick audio transcription via **OpenAI Whisper**, triggered from the Windows rig
 2. In this project folder, add the remote and push:
 
    ```bash
-   git remote add origin https://github.com/YOUR_USERNAME/wildfire.git
+   git remote add origin https://github.com/barliow/wildfire.git
    git branch -M main
    git push -u origin main
    ```
 
-   Replace `YOUR_USERNAME` with your GitHub username.
+   (Use your GitHub username in the URL if it’s not `barliow`.)
 
 ## Project layout
 

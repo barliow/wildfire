@@ -25,6 +25,7 @@ classifiers = [
 ]
 dependencies = [
     "openai-whisper>=20231117",
+    "whisperx",
 ]
 
 [project.optional-dependencies]

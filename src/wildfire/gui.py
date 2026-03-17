@@ -18,13 +18,25 @@ def _run_in_background(
     base_name: str,
     model_id: str,
     move: bool,
+    engine: str,
+    detect_speakers: bool,
+    performance_profile: str,
     status_var: tk.StringVar,
     on_done: Callable[..., None],
 ) -> None:
     try:
-        status_var.set("Copying/moving file…")
+        status_var.set(
+            "Working… (transcribing; first run may download models and take a while)"
+        )
         audio_path, txt_path = run_workflow(
-            source_path, target_dir, base_name, model_id, move
+            source_path,
+            target_dir,
+            base_name,
+            model_id,
+            move,
+            engine=engine,
+            detect_speakers=detect_speakers,
+            performance_profile=performance_profile,
         )
         status_var.set("Done.")
         on_done(success=True, audio_path=audio_path, txt_path=txt_path)
@@ -54,7 +66,10 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
     base_name_var = tk.StringVar(value=default_name)
     model_id_var = tk.StringVar(value=WHISPER_MODELS[0]["id"])
     move_var = tk.BooleanVar(value=False)
-    status_var = tk.StringVar(value="")
+    engine_var = tk.StringVar(value="whisperx")
+    detect_speakers_var = tk.BooleanVar(value=False)
+    performance_profile_var = tk.StringVar(value="balanced")
+    status_var = tk.StringVar(value="Ready.")
 
     # Layout
     main = ttk.Frame(root, padding=12)
@@ -99,6 +114,28 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
     )
     row += 1
 
+    ttk.Label(main, text="Engine:", font=("Segoe UI", 9, "bold")).grid(
+        row=row, column=0, sticky=tk.W, pady=(0, 2)
+    )
+    row += 1
+
+    engine_frame = ttk.Frame(main)
+    engine_frame.grid(row=row, column=0, columnspan=2, sticky=tk.W, pady=(0, 6))
+
+    ttk.Radiobutton(
+        engine_frame,
+        text="WhisperX (recommended)",
+        value="whisperx",
+        variable=engine_var,
+    ).pack(side=tk.LEFT, padx=(0, 12))
+    ttk.Radiobutton(
+        engine_frame,
+        text="Whisper",
+        value="whisper",
+        variable=engine_var,
+    ).pack(side=tk.LEFT)
+    row += 1
+
     ttk.Label(main, text="Whisper model:", font=("Segoe UI", 9, "bold")).grid(
         row=row, column=0, sticky=tk.W, pady=(0, 2)
     )
@@ -137,6 +174,52 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
     )
     row += 1
 
+    ttk.Label(main, text="Options:", font=("Segoe UI", 9, "bold")).grid(
+        row=row, column=0, sticky=tk.W, pady=(0, 2)
+    )
+    row += 1
+
+    options_frame = ttk.Frame(main)
+    options_frame.grid(row=row, column=0, columnspan=2, sticky=tk.EW, pady=(0, 6))
+
+    ttk.Checkbutton(
+        options_frame,
+        text="Detect speakers (WhisperX only)",
+        variable=detect_speakers_var,
+    ).pack(side=tk.LEFT)
+
+    row += 1
+
+    perf_frame = ttk.Frame(main)
+    perf_frame.grid(row=row, column=0, columnspan=2, sticky=tk.EW, pady=(0, 6))
+
+    ttk.Label(perf_frame, text="Performance:").pack(side=tk.LEFT, padx=(0, 6))
+    perf_combo = ttk.Combobox(
+        perf_frame,
+        state="readonly",
+        width=18,
+        values=[
+            "Balanced (recommended)",
+            "Max speed",
+            "Max quality",
+        ],
+    )
+    perf_combo.set("Balanced (recommended)")
+    perf_combo.pack(side=tk.LEFT)
+
+    def update_performance_profile(*_: object) -> None:
+        label = perf_combo.get()
+        if label.startswith("Max speed"):
+            performance_profile_var.set("fast")
+        elif label.startswith("Max quality"):
+            performance_profile_var.set("quality")
+        else:
+            performance_profile_var.set("balanced")
+
+    perf_combo.bind("<<ComboboxSelected>>", update_performance_profile)
+    update_performance_profile()
+    row += 1
+
     ttk.Checkbutton(
         main,
         text="Move source file to target folder (instead of copy)",
@@ -163,9 +246,8 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
     def run():
         target_dir = target_dir_var.get().strip()
         base_name = base_name_var.get().strip()
-        if not target_dir:
-            messagebox.showwarning("Wildfire", "Please choose a target folder.")
-            return
+        target_was_empty = not target_dir
+
         if not base_name:
             messagebox.showwarning("Wildfire", "Please enter a base name.")
             return
@@ -192,6 +274,14 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
             )
             return
 
+        if target_was_empty:
+            # Treat empty target as "use source folder, no move/copy".
+            target_dir = str(Path(source).resolve().parent)
+            target_dir_var.set(target_dir)
+            status_var.set("Transcribing in place… (no copy/move).")
+        else:
+            status_var.set("Preparing to transcribe…")
+
         for w in (btn_ok, btn_cancel, dir_entry, model_combo):
             try:
                 w.config(state=tk.DISABLED)
@@ -199,7 +289,14 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
                 pass
 
         def done(success, error=None, audio_path=None, txt_path=None):
-            root.after(0, lambda: on_done(success, error, audio_path, txt_path))
+            root.after(
+                0,
+                lambda s=success, e=error, a=audio_path, t=txt_path: on_done(
+                    s, e, a, t
+                ),
+            )
+
+        move_flag = bool(move_var.get()) and not target_was_empty
 
         thread = threading.Thread(
             target=_run_in_background,
@@ -208,7 +305,10 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
                 target_dir,
                 base_name,
                 model_id,
-                move_var.get(),
+                move_flag,
+                engine_var.get(),
+                bool(detect_speakers_var.get()),
+                performance_profile_var.get(),
                 status_var,
                 done,
             ),
