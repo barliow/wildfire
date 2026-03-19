@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import threading
-import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
 from typing import Callable
+import json
+import shutil
+import subprocess
+
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
 
 from wildfire.models_info import WHISPER_MODELS
 from wildfire.workflow import run as run_workflow
@@ -21,14 +25,14 @@ def _run_in_background(
     engine: str,
     detect_speakers: bool,
     performance_profile: str,
-    status_var: tk.StringVar,
+    cpu_threads: int | None,
+    min_speakers: int | None,
+    max_speakers: int | None,
+    progress_callback: Callable[[str, float], None] | None,
     on_done: Callable[..., None],
 ) -> None:
     try:
-        status_var.set(
-            "Working… (transcribing; first run may download models and take a while)"
-        )
-        audio_path, txt_path = run_workflow(
+        audio_path, txt_path, segments = run_workflow(
             source_path,
             target_dir,
             base_name,
@@ -36,10 +40,13 @@ def _run_in_background(
             move,
             engine=engine,
             detect_speakers=detect_speakers,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
             performance_profile=performance_profile,
+            cpu_threads=cpu_threads,
+            progress_callback=progress_callback,
         )
-        status_var.set("Done.")
-        on_done(success=True, audio_path=audio_path, txt_path=txt_path)
+        on_done(success=True, audio_path=audio_path, txt_path=txt_path, segments=segments)
     except Exception as e:
         status_var.set("Error.")
         on_done(success=False, error=str(e))
@@ -61,15 +68,63 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
     else:
         default_name = "recording"
 
+    # Settings persistence
+    settings_path = Path.home() / ".wildfire_gui_settings.json"
+
+    def _load_settings() -> dict:
+        try:
+            data = json.loads(settings_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+        return {}
+
+    def _save_settings(
+        model_id: str,
+        detect_speakers: bool,
+        perf_profile: str,
+        expected_speakers: int | None,
+    ) -> None:
+        data = {
+            "model_id": model_id,
+            "detect_speakers": bool(detect_speakers),
+            "performance_profile": perf_profile,
+            "expected_speakers": expected_speakers,
+        }
+        try:
+            settings_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception:
+            # Settings persistence should never break the UI.
+            return
+
+    saved = _load_settings()
+
     # Variables
     target_dir_var = tk.StringVar(value="")
     base_name_var = tk.StringVar(value=default_name)
-    model_id_var = tk.StringVar(value=WHISPER_MODELS[0]["id"])
+    default_model_id = WHISPER_MODELS[0]["id"]
+    saved_model_id = saved.get("model_id") or default_model_id
+    model_id_var = tk.StringVar(value=saved_model_id)
     move_var = tk.BooleanVar(value=False)
     engine_var = tk.StringVar(value="whisperx")
-    detect_speakers_var = tk.BooleanVar(value=False)
-    performance_profile_var = tk.StringVar(value="balanced")
+    detect_speakers_var = tk.BooleanVar(value=bool(saved.get("detect_speakers", False)))
+    performance_profile_var = tk.StringVar(
+        value=str(saved.get("performance_profile") or "balanced")
+    )
+    expected_speakers_var = tk.StringVar(
+        value=str(saved.get("expected_speakers") or "auto")
+    )
+    cpu_threads_var = tk.StringVar(value="auto")
     status_var = tk.StringVar(value="Ready.")
+    progress_var = tk.DoubleVar(value=0.0)
+
+    # Speaker/snippet state (populated after a successful diarized run).
+    speaker_entries: dict[str, tk.StringVar] = {}
+    speaker_snippets: dict[str, tuple[float, float]] = {}
+    last_segments: list[dict] = []
+    last_audio_path: Path | None = None
+    last_txt_path: Path | None = None
 
     # Layout
     main = ttk.Frame(root, padding=12)
@@ -143,13 +198,13 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
 
     model_frame = ttk.Frame(main)
     model_frame.grid(row=row, column=0, columnspan=2, sticky=tk.EW, pady=(0, 4))
+    model_labels = [m["label"] for m in WHISPER_MODELS]
     model_combo = ttk.Combobox(
         model_frame,
         state="readonly",
         width=16,
-        values=[m["label"] for m in WHISPER_MODELS],
+        values=model_labels,
     )
-    model_combo.set(WHISPER_MODELS[0]["label"])
     model_combo.pack(side=tk.LEFT, padx=(0, 8))
 
     info_label = ttk.Label(model_frame, text="", foreground="gray", wraplength=320)
@@ -166,6 +221,17 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
                 break
 
     model_combo.bind("<<ComboboxSelected>>", update_model_info)
+
+    # Restore last-used model selection if available.
+    selected_label = None
+    for m in WHISPER_MODELS:
+        if m["id"] == saved_model_id:
+            selected_label = m["label"]
+            break
+    if not selected_label:
+        selected_label = WHISPER_MODELS[0]["label"]
+        model_id_var.set(WHISPER_MODELS[0]["id"])
+    model_combo.set(selected_label)
     update_model_info()
     row += 1
 
@@ -186,38 +252,98 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
         options_frame,
         text="Detect speakers (WhisperX only)",
         variable=detect_speakers_var,
-    ).pack(side=tk.LEFT)
+    ).pack(side=tk.LEFT, padx=(0, 10))
+
+    ttk.Label(options_frame, text="Expected speakers:").pack(side=tk.LEFT, padx=(0, 6))
+    expected_combo = ttk.Combobox(
+        options_frame,
+        state="readonly",
+        width=6,
+        values=["Auto", "2", "3", "4"],
+    )
+    # Restore last-used expected speakers.
+    if expected_speakers_var.get() in {"2", "3", "4"}:
+        expected_combo.set(expected_speakers_var.get())
+    else:
+        expected_combo.set("Auto")
+        expected_speakers_var.set("auto")
+    expected_combo.pack(side=tk.LEFT)
+
+    def update_expected_speakers(*_: object) -> None:
+        v = expected_combo.get().strip()
+        if v in {"2", "3", "4"}:
+            expected_speakers_var.set(v)
+        else:
+            expected_speakers_var.set("auto")
+
+    expected_combo.bind("<<ComboboxSelected>>", update_expected_speakers)
 
     row += 1
 
     perf_frame = ttk.Frame(main)
     perf_frame.grid(row=row, column=0, columnspan=2, sticky=tk.EW, pady=(0, 6))
 
-    ttk.Label(perf_frame, text="Performance:").pack(side=tk.LEFT, padx=(0, 6))
+    ttk.Label(perf_frame, text="Resource usage:").pack(side=tk.LEFT, padx=(0, 6))
     perf_combo = ttk.Combobox(
         perf_frame,
         state="readonly",
         width=18,
         values=[
             "Balanced (recommended)",
-            "Max speed",
-            "Max quality",
+            "Aggressive (fast, more GPU memory)",
+            "Conservative (lower GPU memory)",
         ],
     )
-    perf_combo.set("Balanced (recommended)")
+    # Restore last-used performance profile.
+    if performance_profile_var.get() == "fast":
+        perf_combo.set("Aggressive (fast, more GPU memory)")
+    elif performance_profile_var.get() == "quality":
+        perf_combo.set("Conservative (lower GPU memory)")
+    else:
+        perf_combo.set("Balanced (recommended)")
     perf_combo.pack(side=tk.LEFT)
 
     def update_performance_profile(*_: object) -> None:
         label = perf_combo.get()
-        if label.startswith("Max speed"):
+        if label.startswith("Aggressive"):
             performance_profile_var.set("fast")
-        elif label.startswith("Max quality"):
+        elif label.startswith("Conservative"):
             performance_profile_var.set("quality")
         else:
             performance_profile_var.set("balanced")
 
     perf_combo.bind("<<ComboboxSelected>>", update_performance_profile)
     update_performance_profile()
+    row += 1
+
+    threads_frame = ttk.Frame(main)
+    threads_frame.grid(row=row, column=0, columnspan=2, sticky=tk.EW, pady=(0, 6))
+
+    ttk.Label(threads_frame, text="CPU threads:").pack(side=tk.LEFT, padx=(0, 6))
+    threads_combo = ttk.Combobox(
+        threads_frame,
+        state="readonly",
+        width=20,
+        values=[
+            "Auto (PyTorch default)",
+            "Half of cores",
+            "All cores",
+        ],
+    )
+    threads_combo.set("Auto (PyTorch default)")
+    threads_combo.pack(side=tk.LEFT)
+
+    def update_cpu_threads(*_: object) -> None:
+        label = threads_combo.get()
+        if label.startswith("Half"):
+            cpu_threads_var.set("half")
+        elif label.startswith("All"):
+            cpu_threads_var.set("all")
+        else:
+            cpu_threads_var.set("auto")
+
+    threads_combo.bind("<<ComboboxSelected>>", update_cpu_threads)
+    update_cpu_threads()
     row += 1
 
     ttk.Checkbutton(
@@ -228,17 +354,237 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
     row += 1
 
     status_label = ttk.Label(main, textvariable=status_var, foreground="gray")
-    status_label.grid(row=row, column=0, columnspan=2, sticky=tk.W, pady=(0, 4))
+    status_label.grid(row=row, column=0, columnspan=2, sticky=tk.W, pady=(0, 2))
     row += 1
 
-    def on_done(success: bool, error: str | None = None, audio_path=None, txt_path=None):
-        if success:
-            messagebox.showinfo(
-                "Wildfire",
-                f"Done.\n\nRecording: {audio_path}\nTranscript: {txt_path}",
+    progress_bar = ttk.Progressbar(
+        main, variable=progress_var, maximum=100.0, mode="determinate"
+    )
+    progress_bar.grid(row=row, column=0, columnspan=2, sticky=tk.EW, pady=(0, 6))
+    row += 1
+
+    keep_anonymous_var = tk.BooleanVar(value=True)
+
+    speakers_frame = ttk.LabelFrame(main, text="Speakers")
+    speakers_frame.grid(row=row, column=0, columnspan=2, sticky=tk.EW, pady=(4, 0))
+    speakers_frame.grid_remove()
+    row += 1
+
+    def _clear_speakers_ui() -> None:
+        for child in speakers_frame.winfo_children():
+            child.destroy()
+        speaker_entries.clear()
+        speaker_snippets.clear()
+
+    def _populate_speakers_ui(segments: list[dict], audio_path: Path) -> None:
+        _clear_speakers_ui()
+
+        speakers: dict[str, tuple[float, float]] = {}
+        for seg in segments:
+            speaker = seg.get("speaker")
+            if not speaker:
+                continue
+            try:
+                start = float(seg.get("start", 0.0))
+                end = float(seg.get("end", start + 3.0))
+            except Exception:
+                continue
+            if end <= start:
+                end = start + 3.0
+            if speaker not in speakers:
+                speakers[speaker] = (start, end)
+
+        if not speakers:
+            speakers_frame.grid_remove()
+            return
+
+        for speaker, (start, end) in sorted(speakers.items()):
+            speaker_snippets[speaker] = (start, end)
+
+        for row_idx, speaker in enumerate(sorted(speakers.keys())):
+            snippet = speaker_snippets[speaker]
+            frame = ttk.Frame(speakers_frame)
+            frame.grid(row=row_idx, column=0, sticky=tk.EW, pady=2)
+
+            ttk.Label(frame, text=speaker).pack(side=tk.LEFT, padx=(0, 6))
+
+            def make_play_cmd(s_id: str) -> Callable[[], None]:
+                def _cmd() -> None:
+                    _play_speaker_snippet(s_id)
+
+                return _cmd
+
+            ttk.Button(frame, text="▶", width=3, command=make_play_cmd(speaker)).pack(
+                side=tk.LEFT, padx=(0, 6)
             )
-            root.quit()
-            root.destroy()
+
+            name_var = tk.StringVar(value="")
+            speaker_entries[speaker] = name_var
+            ttk.Label(frame, text="Name:").pack(side=tk.LEFT, padx=(0, 2))
+            ttk.Entry(frame, textvariable=name_var, width=24).pack(
+                side=tk.LEFT, padx=(0, 4)
+            )
+
+            start_str = f"{snippet[0]:.1f}s"
+            ttk.Label(frame, text=f"({start_str})", foreground="gray").pack(
+                side=tk.LEFT
+            )
+
+        # Footer row: options + apply button.
+        footer = ttk.Frame(speakers_frame)
+        footer.grid(row=len(speakers) + 1, column=0, sticky=tk.EW, pady=(4, 0))
+
+        ttk.Checkbutton(
+            footer,
+            text="Keep anonymous copy of transcript",
+            variable=keep_anonymous_var,
+        ).pack(side=tk.LEFT)
+
+        spacer = ttk.Frame(footer)
+        spacer.pack(side=tk.LEFT, expand=True, fill=tk.X)
+
+        ttk.Button(
+            footer,
+            text="Update speaker names",
+            command=_apply_speaker_names,
+        ).pack(side=tk.RIGHT)
+
+        speakers_frame.grid()
+
+    def _play_speaker_snippet(speaker_id: str) -> None:
+        if speaker_id not in speaker_snippets or last_audio_path is None:
+            return
+
+        start, end = speaker_snippets[speaker_id]
+        duration = max(0.5, end - start)
+
+        ffplay = shutil.which("ffplay")
+        if not ffplay:
+            messagebox.showwarning(
+                "Wildfire",
+                "Audio preview requires FFmpeg's 'ffplay' to be installed and on PATH.",
+            )
+            return
+
+        try:
+            subprocess.Popen(
+                [
+                    ffplay,
+                    "-nodisp",
+                    "-autoexit",
+                    "-loglevel",
+                    "quiet",
+                    "-ss",
+                    f"{start:.2f}",
+                    "-t",
+                    f"{duration:.2f}",
+                    str(last_audio_path),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            # Swallow preview errors so they never kill the main app.
+            return
+
+    def _enable_controls() -> None:
+        for w in (btn_ok, btn_cancel, dir_entry, model_combo):
+            try:
+                w.config(state=tk.NORMAL)
+            except Exception:
+                pass
+
+    def _segments_to_plaintext_with_mapping(
+        segments: list[dict], mapping: dict[str, str]
+    ) -> str:
+        from wildfire.workflow import _format_timestamp  # type: ignore[attr-defined]
+
+        lines: list[str] = []
+        for seg in segments:
+            start = _format_timestamp(float(seg.get("start", 0.0)))
+            end = _format_timestamp(float(seg.get("end", 0.0)))
+            text = str(seg.get("text", "")).strip()
+            if not text:
+                continue
+            speaker = seg.get("speaker")
+            if speaker and speaker in mapping and mapping[speaker]:
+                speaker_label = mapping[speaker]
+            else:
+                speaker_label = speaker
+            prefix = f"[{start} - {end}]"
+            if speaker_label:
+                prefix += f" ({speaker_label})"
+            lines.append(f"{prefix} {text}".rstrip())
+        return "\n".join(lines)
+
+    def _apply_speaker_names() -> None:
+        nonlocal last_segments, last_txt_path
+        if not last_segments or last_txt_path is None:
+            return
+
+        mapping: dict[str, str] = {}
+        for speaker_id, var in speaker_entries.items():
+            name = var.get().strip()
+            if name:
+                mapping[speaker_id] = name
+
+        if not mapping:
+            messagebox.showinfo(
+                "Wildfire", "Please enter at least one speaker name first."
+            )
+            return
+
+        # Apply mapping to in-memory segments.
+        for seg in last_segments:
+            spk = seg.get("speaker")
+            if spk in mapping:
+                seg["speaker"] = mapping[spk]
+
+        new_text = _segments_to_plaintext_with_mapping(last_segments, mapping)
+
+        anon_path = None
+        if keep_anonymous_var.get():
+            # Create an _anonymous copy of the original transcript, and keep the
+            # original filename for the renamed version.
+            anon_path = last_txt_path.with_stem(last_txt_path.stem + "_anonymous")
+            try:
+                if not anon_path.exists():
+                    shutil.copy2(last_txt_path, anon_path)
+            except Exception:
+                # Non-fatal; still try to write the renamed transcript.
+                anon_path = None
+
+        try:
+            last_txt_path.write_text(new_text, encoding="utf-8")
+        except Exception as exc:
+            messagebox.showerror(
+                "Wildfire",
+                f"Failed to update transcript:\n\n{exc}",
+            )
+            return
+
+        status_msg = "Updated transcript with speaker names."
+        if anon_path is not None:
+            status_msg += f" Anonymous copy: {anon_path.name}"
+        status_var.set(status_msg)
+
+    def on_done(
+        success: bool,
+        error: str | None = None,
+        audio_path=None,
+        txt_path=None,
+        segments: list[dict] | None = None,
+    ):
+        nonlocal last_segments, last_audio_path, last_txt_path
+        _enable_controls()
+        if success:
+            last_audio_path = Path(audio_path) if audio_path is not None else None
+            last_txt_path = Path(txt_path) if txt_path is not None else None
+            last_segments = segments or []
+            if last_segments:
+                _populate_speakers_ui(last_segments, last_audio_path)  # type: ignore[arg-type]
+            btn_ok.config(text="Run again")
+            btn_cancel.config(text="Close")
         else:
             messagebox.showerror("Wildfire — Error", error or "Unknown error")
             status_var.set("")
@@ -265,6 +611,7 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
                 if m["label"] == model_label:
                     model_id = m["id"]
                     break
+        model_id_var.set(model_id)
 
         source = source_file
         if not source:
@@ -278,9 +625,10 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
             # Treat empty target as "use source folder, no move/copy".
             target_dir = str(Path(source).resolve().parent)
             target_dir_var.set(target_dir)
-            status_var.set("Transcribing in place… (no copy/move).")
-        else:
-            status_var.set("Preparing to transcribe…")
+        status_var.set(
+            "Working… (transcribing; first run may download models and take a while)"
+        )
+        progress_var.set(0.0)
 
         for w in (btn_ok, btn_cancel, dir_entry, model_combo):
             try:
@@ -288,15 +636,46 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
             except Exception:
                 pass
 
-        def done(success, error=None, audio_path=None, txt_path=None):
+        def report_progress(stage: str, pct: float) -> None:
+            def _update() -> None:
+                status_var.set(f"{stage}… {pct:.0f}%")
+                progress_var.set(pct)
+
+            root.after(0, _update)
+
+        def done(success, error=None, audio_path=None, txt_path=None, segments=None):
             root.after(
                 0,
-                lambda s=success, e=error, a=audio_path, t=txt_path: on_done(
-                    s, e, a, t
+                lambda s=success, e=error, a=audio_path, t=txt_path, seg=segments: on_done(
+                    s, e, a, t, seg
                 ),
             )
 
         move_flag = bool(move_var.get()) and not target_was_empty
+
+        # Map CPU threads preference to an integer override (or None for auto).
+        import multiprocessing
+
+        try:
+            cores = multiprocessing.cpu_count()
+        except NotImplementedError:
+            cores = 0
+
+        cpu_threads_pref = cpu_threads_var.get()
+        if cpu_threads_pref == "all" and cores > 0:
+            cpu_threads = cores
+        elif cpu_threads_pref == "half" and cores > 1:
+            cpu_threads = max(1, cores // 2)
+        else:
+            cpu_threads = None
+
+        exp = expected_speakers_var.get().strip().lower()
+        if exp in {"2", "3", "4"}:
+            min_speakers = int(exp)
+            max_speakers = int(exp)
+        else:
+            min_speakers = None
+            max_speakers = None
 
         thread = threading.Thread(
             target=_run_in_background,
@@ -309,12 +688,23 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
                 engine_var.get(),
                 bool(detect_speakers_var.get()),
                 performance_profile_var.get(),
-                status_var,
+                cpu_threads,
+                min_speakers,
+                max_speakers,
+                report_progress,
                 done,
             ),
         )
         thread.daemon = True
         thread.start()
+
+        # Persist the most important user choices for next run.
+        _save_settings(
+            model_id=model_id_var.get(),
+            detect_speakers=bool(detect_speakers_var.get()),
+            perf_profile=performance_profile_var.get(),
+            expected_speakers=(int(exp) if exp in {"2", "3", "4"} else None),
+        )
 
     btn_cancel = ttk.Button(main, text="Cancel", command=root.destroy)
     btn_cancel.grid(row=row, column=0, padx=(0, 6), pady=(8, 0))
