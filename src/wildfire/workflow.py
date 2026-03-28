@@ -140,9 +140,9 @@ def run(
         target_audio = target_dir / f"{base_name}{audio_ext}"
 
     # Include model id in transcript filename so multiple runs with different
-    # models keep separate outputs.
+    # models keep separate outputs. Default transcript remains anonymous.
     safe_model_id = model_id.replace("/", "-")
-    target_txt = target_dir / f"{base_name}_{safe_model_id}.txt"
+    target_txt = target_dir / f"{base_name}_{safe_model_id}_anonymous.txt"
 
     if not same_folder_no_move:
         if move_instead_of_copy:

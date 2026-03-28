@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import os
 from pathlib import Path
 from typing import Callable
 import json
@@ -125,6 +126,7 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
     last_segments: list[dict] = []
     last_audio_path: Path | None = None
     last_txt_path: Path | None = None
+    last_identified_path: Path | None = None
 
     # Layout
     main = ttk.Frame(root, padding=12)
@@ -259,10 +261,10 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
         options_frame,
         state="readonly",
         width=6,
-        values=["Auto", "2", "3", "4"],
+        values=["Auto", "2", "3", "4", "5", "6", "7", "8", "9", "10"],
     )
     # Restore last-used expected speakers.
-    if expected_speakers_var.get() in {"2", "3", "4"}:
+    if expected_speakers_var.get() in {"2", "3", "4", "5", "6", "7", "8", "9", "10"}:
         expected_combo.set(expected_speakers_var.get())
     else:
         expected_combo.set("Auto")
@@ -271,7 +273,7 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
 
     def update_expected_speakers(*_: object) -> None:
         v = expected_combo.get().strip()
-        if v in {"2", "3", "4"}:
+        if v in {"2", "3", "4", "5", "6", "7", "8", "9", "10"}:
             expected_speakers_var.set(v)
         else:
             expected_speakers_var.set("auto")
@@ -363,7 +365,18 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
     progress_bar.grid(row=row, column=0, columnspan=2, sticky=tk.EW, pady=(0, 6))
     row += 1
 
-    keep_anonymous_var = tk.BooleanVar(value=True)
+    identified_link_var = tk.StringVar(value="")
+    identified_link_label = ttk.Label(
+        main,
+        textvariable=identified_link_var,
+        foreground="#1f6feb",
+        cursor="hand2",
+    )
+    identified_link_label.grid(
+        row=row, column=0, columnspan=2, sticky=tk.W, pady=(0, 6)
+    )
+    identified_link_label.grid_remove()
+    row += 1
 
     speakers_frame = ttk.LabelFrame(main, text="Speakers")
     speakers_frame.grid(row=row, column=0, columnspan=2, sticky=tk.EW, pady=(4, 0))
@@ -430,22 +443,16 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
                 side=tk.LEFT
             )
 
-        # Footer row: options + apply button.
+        # Footer row: generate identified file.
         footer = ttk.Frame(speakers_frame)
         footer.grid(row=len(speakers) + 1, column=0, sticky=tk.EW, pady=(4, 0))
-
-        ttk.Checkbutton(
-            footer,
-            text="Keep anonymous copy of transcript",
-            variable=keep_anonymous_var,
-        ).pack(side=tk.LEFT)
 
         spacer = ttk.Frame(footer)
         spacer.pack(side=tk.LEFT, expand=True, fill=tk.X)
 
         ttk.Button(
             footer,
-            text="Update speaker names",
+            text="Generate file",
             command=_apply_speaker_names,
         ).pack(side=tk.RIGHT)
 
@@ -487,6 +494,22 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
             # Swallow preview errors so they never kill the main app.
             return
 
+    def _open_identified_file() -> None:
+        if last_identified_path is None:
+            return
+        try:
+            if os.name == "nt":
+                os.startfile(str(last_identified_path))  # type: ignore[attr-defined]
+            else:
+                subprocess.Popen(["xdg-open", str(last_identified_path)])
+        except Exception:
+            messagebox.showerror(
+                "Wildfire",
+                f"Couldn't open file:\n\n{last_identified_path}",
+            )
+
+    identified_link_label.bind("<Button-1>", lambda _event: _open_identified_file())
+
     def _enable_controls() -> None:
         for w in (btn_ok, btn_cancel, dir_entry, model_combo):
             try:
@@ -518,7 +541,7 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
         return "\n".join(lines)
 
     def _apply_speaker_names() -> None:
-        nonlocal last_segments, last_txt_path
+        nonlocal last_segments, last_txt_path, last_identified_path
         if not last_segments or last_txt_path is None:
             return
 
@@ -534,39 +557,25 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
             )
             return
 
-        # Apply mapping to in-memory segments.
-        for seg in last_segments:
-            spk = seg.get("speaker")
-            if spk in mapping:
-                seg["speaker"] = mapping[spk]
-
         new_text = _segments_to_plaintext_with_mapping(last_segments, mapping)
-
-        anon_path = None
-        if keep_anonymous_var.get():
-            # Create an _anonymous copy of the original transcript, and keep the
-            # original filename for the renamed version.
-            anon_path = last_txt_path.with_stem(last_txt_path.stem + "_anonymous")
-            try:
-                if not anon_path.exists():
-                    shutil.copy2(last_txt_path, anon_path)
-            except Exception:
-                # Non-fatal; still try to write the renamed transcript.
-                anon_path = None
+        identified_stem = last_txt_path.stem
+        if identified_stem.endswith("_anonymous"):
+            identified_stem = identified_stem[: -len("_anonymous")]
+        identified_path = last_txt_path.with_stem(identified_stem + "_identified")
 
         try:
-            last_txt_path.write_text(new_text, encoding="utf-8")
+            identified_path.write_text(new_text, encoding="utf-8")
         except Exception as exc:
             messagebox.showerror(
                 "Wildfire",
-                f"Failed to update transcript:\n\n{exc}",
+                f"Failed to generate identified transcript:\n\n{exc}",
             )
             return
 
-        status_msg = "Updated transcript with speaker names."
-        if anon_path is not None:
-            status_msg += f" Anonymous copy: {anon_path.name}"
-        status_var.set(status_msg)
+        last_identified_path = identified_path
+        identified_link_var.set(f"Open identified file: {identified_path.name}")
+        identified_link_label.grid()
+        status_var.set(f"Generated identified transcript: {identified_path.name}")
 
     def on_done(
         success: bool,
@@ -575,12 +584,15 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
         txt_path=None,
         segments: list[dict] | None = None,
     ):
-        nonlocal last_segments, last_audio_path, last_txt_path
+        nonlocal last_segments, last_audio_path, last_txt_path, last_identified_path
         _enable_controls()
         if success:
             last_audio_path = Path(audio_path) if audio_path is not None else None
             last_txt_path = Path(txt_path) if txt_path is not None else None
             last_segments = segments or []
+            last_identified_path = None
+            identified_link_var.set("")
+            identified_link_label.grid_remove()
             if last_segments:
                 _populate_speakers_ui(last_segments, last_audio_path)  # type: ignore[arg-type]
             btn_ok.config(text="Run again")
@@ -670,7 +682,7 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
             cpu_threads = None
 
         exp = expected_speakers_var.get().strip().lower()
-        if exp in {"2", "3", "4"}:
+        if exp in {"2", "3", "4", "5", "6", "7", "8", "9", "10"}:
             min_speakers = int(exp)
             max_speakers = int(exp)
         else:
@@ -703,7 +715,9 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
             model_id=model_id_var.get(),
             detect_speakers=bool(detect_speakers_var.get()),
             perf_profile=performance_profile_var.get(),
-            expected_speakers=(int(exp) if exp in {"2", "3", "4"} else None),
+            expected_speakers=(
+                int(exp) if exp in {"2", "3", "4", "5", "6", "7", "8", "9", "10"} else None
+            ),
         )
 
     btn_cancel = ttk.Button(main, text="Cancel", command=root.destroy)
