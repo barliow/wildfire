@@ -49,7 +49,18 @@ WHISPER_MODELS = [
         "accuracy": "Best — multi-speaker, noise, all languages",
         "disk": "~6 GB",
     },
+    {
+        "id": "large-v3-turbo",
+        "label": "Large v3 Turbo (recommended)",
+        "params": "809M",
+        "speed": "~5–8× faster than Large v3, near-identical accuracy",
+        "accuracy": "Near-best — ideal default on a GPU",
+        "disk": "~1.6 GB",
+    },
 ]
+
+# Recommended default model. Turbo is the best speed/accuracy trade-off on a GPU.
+DEFAULT_MODEL_ID = "large-v3-turbo"
 
 # Valid model IDs for whisper.load_model()
 VALID_MODEL_IDS = [m["id"] for m in WHISPER_MODELS]

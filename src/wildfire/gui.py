@@ -13,8 +13,83 @@ import subprocess
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from wildfire.models_info import WHISPER_MODELS
+from wildfire.models_info import WHISPER_MODELS, DEFAULT_MODEL_ID
 from wildfire.workflow import run as run_workflow
+
+# Bounds for a speaker voice-preview snippet (seconds).
+_MIN_SNIPPET_SECONDS = 1.5
+_MAX_SNIPPET_SECONDS = 8.0
+
+
+def _speaker_snippets_from_words(segments: list[dict]) -> dict[str, tuple[float, float]]:
+    """Pick a clean, representative audio span per speaker for voice preview.
+
+    Whisper segments often straddle a speaker change, so the *segment* start can
+    contain the tail of the previous speaker. WhisperX alignment + diarization
+    label individual words with a speaker, so we instead find the longest
+    *contiguous* run of words spoken by each speaker and start playback exactly
+    where that speaker begins. Falls back to the speaker's longest segment when
+    word-level data isn't available.
+    """
+    # Flatten words that have both timing and a speaker label, in transcript order.
+    ordered: list[tuple[float, float, str]] = []
+    for seg in segments:
+        for w in seg.get("words") or []:
+            spk = w.get("speaker") or seg.get("speaker")
+            start = w.get("start")
+            end = w.get("end")
+            if spk is None or start is None or end is None:
+                continue
+            try:
+                ordered.append((float(start), float(end), str(spk)))
+            except (TypeError, ValueError):
+                continue
+
+    best: dict[str, tuple[float, float]] = {}
+
+    if ordered:
+        # Keep the longest contiguous same-speaker run, per speaker.
+        def _consider(spk: str, start: float, end: float) -> None:
+            prev = best.get(spk)
+            if prev is None or (end - start) > (prev[1] - prev[0]):
+                best[spk] = (start, end)
+
+        run_start, run_end, run_spk = ordered[0]
+        for start, end, spk in ordered[1:]:
+            if spk == run_spk:
+                run_end = end
+            else:
+                _consider(run_spk, run_start, run_end)
+                run_start, run_end, run_spk = start, end, spk
+        _consider(run_spk, run_start, run_end)
+
+    # Fallback: speakers with no usable word run get their longest segment.
+    seg_best: dict[str, tuple[float, float]] = {}
+    for seg in segments:
+        spk = seg.get("speaker")
+        if not spk or spk in best:
+            continue
+        try:
+            start = float(seg.get("start", 0.0))
+            end = float(seg.get("end", start))
+        except (TypeError, ValueError):
+            continue
+        if end <= start:
+            end = start + _MIN_SNIPPET_SECONDS
+        prev = seg_best.get(spk)
+        if prev is None or (end - start) > (prev[1] - prev[0]):
+            seg_best[spk] = (start, end)
+    best.update(seg_best)
+
+    # Clamp each snippet to a short, clearly-identifiable window.
+    capped: dict[str, tuple[float, float]] = {}
+    for spk, (start, end) in best.items():
+        if end - start < _MIN_SNIPPET_SECONDS:
+            end = start + _MIN_SNIPPET_SECONDS
+        elif end - start > _MAX_SNIPPET_SECONDS:
+            end = start + _MAX_SNIPPET_SECONDS
+        capped[spk] = (start, end)
+    return capped
 
 
 def _run_in_background(
@@ -104,7 +179,7 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
     # Variables
     target_dir_var = tk.StringVar(value="")
     base_name_var = tk.StringVar(value=default_name)
-    default_model_id = WHISPER_MODELS[0]["id"]
+    default_model_id = DEFAULT_MODEL_ID
     saved_model_id = saved.get("model_id") or default_model_id
     model_id_var = tk.StringVar(value=saved_model_id)
     move_var = tk.BooleanVar(value=False)
@@ -392,26 +467,13 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
     def _populate_speakers_ui(segments: list[dict], audio_path: Path) -> None:
         _clear_speakers_ui()
 
-        speakers: dict[str, tuple[float, float]] = {}
-        for seg in segments:
-            speaker = seg.get("speaker")
-            if not speaker:
-                continue
-            try:
-                start = float(seg.get("start", 0.0))
-                end = float(seg.get("end", start + 3.0))
-            except Exception:
-                continue
-            if end <= start:
-                end = start + 3.0
-            if speaker not in speakers:
-                speakers[speaker] = (start, end)
+        speakers = _speaker_snippets_from_words(segments)
 
         if not speakers:
             speakers_frame.grid_remove()
             return
 
-        for speaker, (start, end) in sorted(speakers.items()):
+        for speaker, (start, end) in speakers.items():
             speaker_snippets[speaker] = (start, end)
 
         for row_idx, speaker in enumerate(sorted(speakers.keys())):

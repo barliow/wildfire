@@ -181,12 +181,16 @@ def run(
                 "variable to be set with a valid Hugging Face access token."
             )
         DiarizationPipeline = _get_diarization_pipeline()
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        # WhisperX 3.8+ takes `token=`; older versions used `use_auth_token=`.
+        # It already defaults to the newer `pyannote/speaker-diarization-community-1`
+        # pipeline, which is markedly more accurate on noisy meeting audio.
         try:
-            diarize_model = DiarizationPipeline(device="cuda" if torch.cuda.is_available() else "cpu")
+            diarize_model = DiarizationPipeline(token=token, device=device)
         except TypeError:
             diarize_model = DiarizationPipeline(
                 use_auth_token=token,
-                device="cuda" if torch.cuda.is_available() else "cpu",
+                device=device,
             )
 
     if engine_normalized == "whisper":
