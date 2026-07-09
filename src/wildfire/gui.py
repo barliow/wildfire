@@ -16,6 +16,24 @@ from tkinter import filedialog, messagebox, ttk
 from wildfire.models_info import WHISPER_MODELS, DEFAULT_MODEL_ID
 from wildfire.workflow import run as run_workflow
 
+# Selectable input languages. Whisper uses a single "en" code for English (it has
+# no separate British-English model), so British English maps to "en". "Auto"
+# lets Whisper detect the language, which can drift on quiet/non-speech audio.
+LANGUAGE_CHOICES: list[tuple[str, str | None]] = [
+    ("English", "en"),
+    ("Auto-detect", None),
+    ("French", "fr"),
+    ("German", "de"),
+    ("Spanish", "es"),
+    ("Italian", "it"),
+    ("Dutch", "nl"),
+    ("Portuguese", "pt"),
+    ("Polish", "pl"),
+    ("Russian", "ru"),
+    ("Welsh", "cy"),
+]
+DEFAULT_LANGUAGE_CODE = "en"
+
 # Bounds for a speaker voice-preview snippet (seconds).
 _MIN_SNIPPET_SECONDS = 1.5
 _MAX_SNIPPET_SECONDS = 8.0
@@ -104,6 +122,7 @@ def _run_in_background(
     cpu_threads: int | None,
     min_speakers: int | None,
     max_speakers: int | None,
+    language: str | None,
     progress_callback: Callable[[str, float], None] | None,
     on_done: Callable[..., None],
 ) -> None:
@@ -120,6 +139,7 @@ def _run_in_background(
             max_speakers=max_speakers,
             performance_profile=performance_profile,
             cpu_threads=cpu_threads,
+            language=language,
             progress_callback=progress_callback,
         )
         on_done(success=True, audio_path=audio_path, txt_path=txt_path, segments=segments)
@@ -161,12 +181,14 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
         detect_speakers: bool,
         perf_profile: str,
         expected_speakers: int | None,
+        language: str | None,
     ) -> None:
         data = {
             "model_id": model_id,
             "detect_speakers": bool(detect_speakers),
             "performance_profile": perf_profile,
             "expected_speakers": expected_speakers,
+            "language": language,
         }
         try:
             settings_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -191,6 +213,13 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
     expected_speakers_var = tk.StringVar(
         value=str(saved.get("expected_speakers") or "auto")
     )
+    # Input language code; "" means Auto-detect. Default to English on first run,
+    # but honor a previously saved choice (including an explicit Auto = None).
+    if "language" in saved:
+        initial_language_code = saved.get("language") or ""
+    else:
+        initial_language_code = DEFAULT_LANGUAGE_CODE
+    language_var = tk.StringVar(value=initial_language_code)
     cpu_threads_var = tk.StringVar(value="auto")
     status_var = tk.StringVar(value="Ready.")
     progress_var = tk.DoubleVar(value=0.0)
@@ -310,6 +339,50 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
         model_id_var.set(WHISPER_MODELS[0]["id"])
     model_combo.set(selected_label)
     update_model_info()
+    row += 1
+
+    ttk.Label(main, text="Input language:", font=("Segoe UI", 9, "bold")).grid(
+        row=row, column=0, sticky=tk.W, pady=(0, 2)
+    )
+    row += 1
+
+    language_frame = ttk.Frame(main)
+    language_frame.grid(row=row, column=0, columnspan=2, sticky=tk.EW, pady=(0, 4))
+
+    language_labels = [label for label, _code in LANGUAGE_CHOICES]
+    language_combo = ttk.Combobox(
+        language_frame,
+        state="readonly",
+        width=16,
+        values=language_labels,
+    )
+    language_combo.pack(side=tk.LEFT, padx=(0, 8))
+
+    ttk.Label(
+        language_frame,
+        text="Pinning the language stops mis-detection into another language.",
+        foreground="gray",
+        wraplength=320,
+    ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+    def update_language(*_: object) -> None:
+        sel = language_combo.get()
+        for label, code in LANGUAGE_CHOICES:
+            if label == sel:
+                language_var.set(code or "")
+                break
+
+    language_combo.bind("<<ComboboxSelected>>", update_language)
+
+    # Restore last-used language selection (matching by code; "" == Auto-detect).
+    current_code = language_var.get()
+    selected_language_label = None
+    for label, code in LANGUAGE_CHOICES:
+        if (code or "") == current_code:
+            selected_language_label = label
+            break
+    language_combo.set(selected_language_label or LANGUAGE_CHOICES[0][0])
+    update_language()
     row += 1
 
     ttk.Separator(main, orient=tk.HORIZONTAL).grid(
@@ -751,6 +824,8 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
             min_speakers = None
             max_speakers = None
 
+        language = language_var.get().strip() or None
+
         thread = threading.Thread(
             target=_run_in_background,
             args=(
@@ -765,6 +840,7 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
                 cpu_threads,
                 min_speakers,
                 max_speakers,
+                language,
                 report_progress,
                 done,
             ),
@@ -780,6 +856,7 @@ def show_wildfire_dialog(source_file: str | None = None) -> None:
             expected_speakers=(
                 int(exp) if exp in {"2", "3", "4", "5", "6", "7", "8", "9", "10"} else None
             ),
+            language=language,
         )
 
     btn_cancel = ttk.Button(main, text="Cancel", command=root.destroy)

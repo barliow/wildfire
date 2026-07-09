@@ -112,6 +112,7 @@ def run(
     max_speakers: int | None = None,
     performance_profile: str = "balanced",
     cpu_threads: int | None = None,
+    language: str | None = None,
     progress_callback: Callable[[str, float], None] | None = None,
 ) -> tuple[Path, Path, list[dict]]:
     """Copy or move source, transcribe, and save timestamped plaintext transcript.
@@ -151,6 +152,13 @@ def run(
             shutil.copy2(str(source), str(target_audio))
 
     engine_normalized = (engine or "whisperx").lower()
+
+    # Normalize the requested input language. An explicit language pins Whisper's
+    # decoder so it can't auto-detect (and drift to) the wrong language. Treat
+    # empty / "auto" as "let Whisper decide".
+    language_normalized = (language or "").strip().lower() or None
+    if language_normalized == "auto":
+        language_normalized = None
 
     # Optionally override CPU thread count for this run.
     if cpu_threads and cpu_threads > 0:
@@ -196,7 +204,10 @@ def run(
     if engine_normalized == "whisper":
         report("Transcribing (Whisper)", 0.0)
         model = whisper.load_model(model_id)
-        result = model.transcribe(str(target_audio))
+        whisper_kwargs: dict = {}
+        if language_normalized:
+            whisper_kwargs["language"] = language_normalized
+        result = model.transcribe(str(target_audio), **whisper_kwargs)
         segments = result.get("segments") or []
         if segments:
             text = _segments_to_plaintext(segments)
@@ -219,10 +230,21 @@ def run(
         batch_size = 16
 
     audio = whisperx.load_audio(str(target_audio))
-    model = whisperx.load_model(model_id, device, compute_type=compute_type)
+
+    # Pin the language at load time so WhisperX skips auto-detection entirely
+    # when the caller specifies one (prevents drifting to the wrong language).
+    try:
+        model = whisperx.load_model(
+            model_id, device, compute_type=compute_type, language=language_normalized
+        )
+    except TypeError:
+        # Older whisperx builds may not accept language= on load_model.
+        model = whisperx.load_model(model_id, device, compute_type=compute_type)
 
     report("Transcribing", 0.0)
     tx_kwargs: dict = {"batch_size": batch_size}
+    if language_normalized:
+        tx_kwargs["language"] = language_normalized
 
     if progress_callback is not None:
         def _whisperx_progress(p: float) -> None:
@@ -234,13 +256,15 @@ def run(
     try:
         result = model.transcribe(audio, **tx_kwargs)
     except TypeError:
-        # Installed whisperx version might not support progress_callback.
+        # Installed whisperx version might not support all kwargs; drop the
+        # optional ones and retry (language stays pinned via load_model above).
         tx_kwargs.pop("progress_callback", None)
+        tx_kwargs.pop("language", None)
         result = model.transcribe(audio, **tx_kwargs)
 
     report("Transcribing", 100.0)
 
-    language = result.get("language")
+    language = language_normalized or result.get("language")
 
     if use_word_timestamps and language:
         report("Aligning", 0.0)
